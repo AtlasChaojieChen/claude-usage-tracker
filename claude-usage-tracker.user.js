@@ -18,7 +18,7 @@
 // @grant GM.setValue
 // ==/UserScript==
 
-(function () {
+(async () => {
   "use strict";
 
   // =====================================================================
@@ -83,26 +83,27 @@
   ];
 
   // =====================================================================
-  // STORAGE
+  // STORAGE — promise-based wrappers around GM.* (per SKILL guidance)
   // =====================================================================
 
-  const store = {
-    get(k, fb) {
-      try {
-        return GM_getValue(k, fb);
-      } catch {
-        return fb;
-      }
-    },
-    set(k, v) {
-      try {
-        GM_setValue(k, v);
-      } catch {}
-    },
-  };
+  async function storeGet(key, fallback) {
+    try {
+      return await GM.getValue(key, fallback);
+    } catch {
+      return fallback;
+    }
+  }
+
+  async function storeSet(key, value) {
+    try {
+      await GM.setValue(key, value);
+    } catch {
+      /* ignore */
+    }
+  }
 
   // =====================================================================
-  // FETCH
+  // FETCH — same-origin to claude.ai, uses native fetch with credentials
   // =====================================================================
 
   async function fetchRetry(url, opts = {}, tries = 3) {
@@ -143,9 +144,8 @@
       _loggedUsageOnce = true;
     }
 
-    // Routines budget — best-effort, swallow failures.
+    // Routines budget — best-effort fetch, swallow failures.
     // Endpoint and headers reverse-engineered from ClaudeKarma's source.
-    // Response shape: { used: number, limit: number }
     let routines = null;
     try {
       const rRes = await fetch("/v1/code/routines/run-budget", {
@@ -213,7 +213,7 @@
   }
 
   // =====================================================================
-  // ROUTINES — count today's runs from whatever shape the endpoint returns
+  // ROUTINES
   // =====================================================================
 
   function countRoutinesToday(routines) {
@@ -262,11 +262,11 @@
     );
   }
 
-  function recordSnapshot(usage) {
+  async function recordSnapshot(usage) {
     const sevenDay = usage?.seven_day?.utilization;
     if (typeof sevenDay !== "number") return;
 
-    const state = store.get(STORAGE_KEY, {}) || {};
+    const state = (await storeGet(STORAGE_KEY, {})) || {};
     if (!state.history) state.history = {};
 
     const key = todayKey();
@@ -282,11 +282,21 @@
     const keys = Object.keys(state.history).sort();
     while (keys.length > HISTORY_DAYS) delete state.history[keys.shift()];
 
-    store.set(STORAGE_KEY, state);
+    await storeSet(STORAGE_KEY, state);
+  }
+
+  /**
+   * Reads from a CACHED in-memory copy of history; the cache is refreshed
+   * on every successful tick(). This keeps render() synchronous so we
+   * don't have to thread async through every UI helper.
+   */
+  let _historyCache = {};
+  async function refreshHistoryCache() {
+    const state = (await storeGet(STORAGE_KEY, {})) || {};
+    _historyCache = state.history || {};
   }
 
   function getHistoryDays(n = 7) {
-    const hist = (store.get(STORAGE_KEY, {}) || {}).history || {};
     const out = [];
     for (let i = n - 1; i >= 0; i--) {
       const d = new Date();
@@ -297,7 +307,7 @@
         String(d.getMonth() + 1).padStart(2, "0") +
         "-" +
         String(d.getDate()).padStart(2, "0");
-      const day = hist[k];
+      const day = _historyCache[k];
       const usage = day
         ? Math.max(0, day.endSevenDay - day.startSevenDay)
         : null;
@@ -326,14 +336,6 @@
       .replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
-  /**
-   * Pick which weekly bars to show.
-   *   - HIDE_FIELDS → skip
-   *   - null utilization → skip
-   *   - in ALWAYS_SHOW_FIELDS → show even at 0%
-   *   - otherwise → show only if utilization > 0
-   *   - extra_usage → only when is_enabled === true
-   */
   function pickWeeklyBars(usage) {
     if (!usage) return [];
     const seen = new Set();
@@ -359,13 +361,8 @@
     if (ex) {
       const enabled = ex.is_enabled === true;
       if (enabled) {
-        // The API returns Anthropic's default $2000 spending cap as
-        // monthly_limit even before the user has prepaid anything.
-        // We can't see the prepaid balance directly, so use this
-        // heuristic: if used_credits is 0, assume no funds added
-        // and render the bar as fully maxed (red) to signal "no
-        // extra usage available". The bar corrects itself the
-        // moment any spending registers.
+        // Heuristic: if used_credits is 0, treat as not funded → max red bar.
+        // The bar self-corrects the moment any spending registers.
         const usedC = typeof ex.used_credits === "number" ? ex.used_credits : 0;
         const limitC =
           typeof ex.monthly_limit === "number" ? ex.monthly_limit : 0;
@@ -388,7 +385,6 @@
           out.push({ key: "extra_usage", label: "Extra", pct, sub });
         }
       } else {
-        // Feature exists on plan but user has it disabled — show as N/A.
         out.push({
           key: "extra_usage",
           label: "Extra",
@@ -491,7 +487,7 @@
   };
 
   // =====================================================================
-  // AREA CHART — labels above every dot, always
+  // AREA CHART
   // =====================================================================
 
   function smoothPath(points, tension = 6) {
@@ -519,7 +515,7 @@
     const W = 360,
       H = 90;
     const padX = 14;
-    const labelBand = 18; // reserved at top for value labels
+    const labelBand = 18;
     const padBottom = 4;
     const innerW = W - padX * 2;
     const innerH = H - labelBand - padBottom;
@@ -594,7 +590,7 @@
   const STYLES = `
       :host { all: initial; }
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
+ 
       .root {
         position: fixed; bottom: 20px; right: 20px; z-index: 2147483000;
         font-family: 'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -602,7 +598,7 @@
         -webkit-font-smoothing: antialiased;
         user-select: none;
       }
-
+ 
       .card {
         background: linear-gradient(155deg, #2a2521 0%, #221f1c 60%, #1f1d1a 100%);
         border: 1px solid #3a352f;
@@ -623,7 +619,7 @@
         opacity: 0.5;
       }
       .card > * { position: relative; z-index: 1; }
-
+ 
       .ed-top {
         display: flex; justify-content: space-between; align-items: center;
         padding: 0 4px; margin-bottom: 8px;
@@ -656,8 +652,7 @@
         background: transparent; border: none; font-family: inherit;
       }
       .ed-top .x:hover { background: rgba(255,255,255,0.05); color: #d6cfc4; }
-
-      /* Refresh button — same shape as ×, with spin on click */
+ 
       .ed-top .refresh {
         width: 18px; height: 18px; border-radius: 6px;
         display: flex; align-items: center; justify-content: center;
@@ -680,13 +675,11 @@
         from { transform: rotate(0deg); }
         to   { transform: rotate(360deg); }
       }
-
       .ed-top .actions { display: flex; align-items: center; gap: 2px; }
-
+ 
       .expanded { width: 360px; padding: 14px; }
       .ed-row { display: flex; gap: 10px; margin-bottom: 8px; align-items: stretch; }
-
-      /* RING */
+ 
       .ed-ring {
         flex: none; width: 148px; height: 148px;
         display: flex; align-items: center; justify-content: center;
@@ -710,7 +703,6 @@
         transition: opacity 220ms, transform 220ms, font-size 200ms;
         pointer-events: none;
       }
-      /* Three-digit values (i.e. 100) — shrink so the % stays inside the ring. */
       .ed-num.is-wide { font-size: 30px; }
       .ed-num.is-wide .pct { font-size: 0.42em; }
       .ed-num .pct {
@@ -724,8 +716,7 @@
       .ed-num.is-week { opacity: 0; transform: scale(0.96); }
       .ed-ring.hov-outer .ed-num.is-hour { opacity: 0; transform: scale(0.96); }
       .ed-ring.hov-outer .ed-num.is-week { opacity: 1; transform: scale(1); }
-
-      /* WEEKLY PANEL */
+ 
       .ed-week {
         flex: 1;
         background: rgba(255,255,255,0.018);
@@ -810,7 +801,7 @@
       }
       .ed-bar .fill.crit { box-shadow: 0 0 5px rgba(237,77,58,0.45); }
       .ed-week-head .big.tier-crit { text-shadow: 0 0 8px rgba(237,77,58,0.4); }
-
+ 
       .clr-low    { color: #7cb87c; }
       .clr-midlow { color: #c9bd5a; }
       .clr-mid    { color: #d4a857; }
@@ -822,8 +813,7 @@
       .bg-high   { background: linear-gradient(90deg, #d65947, #e2614e); }
       .bg-crit   { background: linear-gradient(90deg, #d83a28, #ed4d3a); }
       .bg-disabled { background: transparent; }
-
-      /* Disabled bar — feature exists on plan but user has it off */
+ 
       .ed-bar.disabled .name { color: #8b8275; font-style: italic; }
       .ed-bar.disabled .val {
         color: #6a625a;
@@ -835,7 +825,7 @@
       .ed-bar.disabled .track {
         background: rgba(72,65,58,0.25);
       }
-
+ 
       .ed-reset {
         text-align: center;
         font-family: 'Fraunces', serif;
@@ -848,8 +838,7 @@
         color: #d6cfc4; font-style: normal; font-weight: 500;
         font-family: 'Instrument Sans', sans-serif;
       }
-
-      /* DAILY CHART */
+ 
       .ed-daily {
         background: rgba(255,255,255,0.018);
         border: 1px solid #3a352f;
@@ -882,7 +871,7 @@
         fill: #cc785c;
         filter: drop-shadow(0 0 5px rgba(204,120,92,0.7));
       }
-
+ 
       .b-lbl {
         position: absolute;
         transform: translate(-50%, -100%);
@@ -902,7 +891,7 @@
         font-weight: 500;
         font-size: 11px;
       }
-
+ 
       .ed-daily .lbls {
         display: grid; grid-template-columns: repeat(7, 1fr);
         margin-top: 4px;
@@ -913,8 +902,7 @@
       }
       .ed-daily .lbls span { text-transform: uppercase; }
       .ed-daily .lbls span.today { color: #cc785c; font-weight: 600; }
-
-      /* COLLAPSED PILL — hourly LEFT, weekly RIGHT */
+ 
       .collapsed {
         display: inline-flex; align-items: center; gap: 10px;
         padding: 7px 13px; border-radius: 999px;
@@ -924,7 +912,7 @@
         transition: transform 150ms;
       }
       .collapsed:hover { transform: translateY(-1px); }
-
+ 
       .pill-mini {
         width: 22px; height: 22px; border-radius: 99px;
         flex: none; position: relative;
@@ -936,7 +924,7 @@
       }
       .pill-mini .arc-inner { inset: 3px; }
       .pill-mini .core      { inset: 7px; background: #221f1c; z-index: 1; }
-
+ 
       .collapsed .num {
         font-family: 'Fraunces', serif;
         font-style: italic; font-size: 15px;
@@ -953,7 +941,7 @@
         font-family: 'Instrument Sans', sans-serif;
         font-weight: 400; font-size: 13px;
       }
-
+ 
       .err {
         padding: 16px 14px;
         font-family: 'Fraunces', serif;
@@ -984,6 +972,7 @@
 
   function render() {
     const host = ensureHost();
+    if (!host) return;
     const shadow = host.shadowRoot;
     const root = shadow.getElementById("cut2-root");
     if (!root) return;
@@ -1008,7 +997,6 @@
     const colW = PALETTE[tierW].stroke;
     const colH = PALETTE[tierH].stroke;
 
-    // Hourly LEFT, weekly RIGHT
     root.innerHTML = `
           <div class="card collapsed" id="cut2-card">
             <span class="pill-mini">
@@ -1023,7 +1011,7 @@
         `;
 
     const card = root.querySelector("#cut2-card");
-    attachDrag(card, root, () => setCollapsed(false));
+    if (card) attachDrag(card, root, () => setCollapsed(false));
   }
 
   function renderExpanded(root) {
@@ -1067,12 +1055,12 @@
                 <button class="x" id="cut2-close" title="Collapse">×</button>
               </div>
             </div>
-
+ 
             <div class="ed-row">
               <div class="ed-ring" id="cut2-ring">
                 ${ringSVG(w, h)}
               </div>
-
+ 
               <div class="ed-week">
                 <div class="ed-week-head">
                   <span class="label">Weekly</span>
@@ -1088,7 +1076,7 @@
                 </div>
               </div>
             </div>
-
+ 
             <div class="ed-reset" data-reset-at="${fiveReset || ""}">
               ${
                 fiveReset
@@ -1098,7 +1086,7 @@
                   : "5-hour limit fresh"
               }
             </div>
-
+ 
             <div class="ed-daily">
               <div class="head-row">
                 <span class="label">Last 7 Days</span>
@@ -1124,27 +1112,24 @@
     const refreshBtn = root.querySelector("#cut2-refresh");
     const ring = root.querySelector("#cut2-ring");
 
-    closeBtn.addEventListener("click", (e) => {
+    closeBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       setCollapsed(true);
     });
 
-    refreshBtn.addEventListener("click", (e) => {
+    refreshBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       refreshBtn.classList.add("spinning");
       tick(true);
     });
 
-    // If we're already loading on first paint, show the spin
-    if (state.loading) refreshBtn.classList.add("spinning");
+    if (state.loading && refreshBtn) refreshBtn.classList.add("spinning");
 
-    attachDrag(handle, root, null);
-    attachRingHover(ring);
+    if (handle) attachDrag(handle, root, null);
+    if (ring) attachRingHover(ring);
   }
 
   function weeklyBarRow(bar) {
-    // Disabled feature (e.g. extra_usage with is_enabled=false): render
-    // a muted row with N/A in place of the percentage.
     if (bar.disabled) {
       return `
               <div class="ed-bar disabled">
@@ -1211,12 +1196,13 @@
         `;
     root
       .querySelector("#cut2-retry")
-      .addEventListener("click", () => tick(true));
-    root.querySelector("#cut2-close").addEventListener("click", (e) => {
+      ?.addEventListener("click", () => tick(true));
+    root.querySelector("#cut2-close")?.addEventListener("click", (e) => {
       e.stopPropagation();
       setCollapsed(true);
     });
-    attachDrag(root.querySelector("#cut2-handle"), root, null);
+    const handle = root.querySelector("#cut2-handle");
+    if (handle) attachDrag(handle, root, null);
   }
 
   // =====================================================================
@@ -1300,6 +1286,67 @@
   }
 
   // =====================================================================
+  // POSITION ANCHORING — side-aware so the card stays flush against
+  // whichever edge it's closest to, regardless of its current size.
+  // =====================================================================
+
+  /**
+   * Compute the closest-edge anchor for a card given its current bounding rect.
+   * Returns { horizontalSide, horizontalDist, verticalSide, verticalDist }.
+   */
+  function computeAnchor(rect) {
+    const distLeft = rect.left;
+    const distRight = window.innerWidth - rect.right;
+    const distTop = rect.top;
+    const distBottom = window.innerHeight - rect.bottom;
+    return {
+      horizontalSide: distLeft <= distRight ? "left" : "right",
+      horizontalDist: Math.min(distLeft, distRight),
+      verticalSide: distTop <= distBottom ? "top" : "bottom",
+      verticalDist: Math.min(distTop, distBottom),
+    };
+  }
+
+  /**
+   * Apply an anchor to the root by setting the right CSS sides to numbers
+   * and the opposite sides to 'auto'. The card sticks to its anchored edges.
+   */
+  function applyAnchor(root, pos) {
+    if (pos.horizontalSide === "left") {
+      root.style.left = pos.horizontalDist + "px";
+      root.style.right = "auto";
+    } else {
+      root.style.right = pos.horizontalDist + "px";
+      root.style.left = "auto";
+    }
+    if (pos.verticalSide === "top") {
+      root.style.top = pos.verticalDist + "px";
+      root.style.bottom = "auto";
+    } else {
+      root.style.bottom = pos.verticalDist + "px";
+      root.style.top = "auto";
+    }
+  }
+
+  /**
+   * Migrate older saved positions ({right, bottom}) to the new anchor format.
+   * Returns null if the input is missing or malformed.
+   */
+  function migrateAnchor(pos) {
+    if (!pos) return null;
+    if (pos.horizontalSide && pos.verticalSide) return pos; // already new
+    if (Number.isFinite(pos.right) && Number.isFinite(pos.bottom)) {
+      return {
+        horizontalSide: "right",
+        horizontalDist: pos.right,
+        verticalSide: "bottom",
+        verticalDist: pos.bottom,
+      };
+    }
+    return null;
+  }
+
+  // =====================================================================
   // DRAG
   // =====================================================================
 
@@ -1313,8 +1360,8 @@
       const startX = e.clientX,
         startY = e.clientY;
       const rect = root.getBoundingClientRect();
-      const startRight = window.innerWidth - rect.right;
-      const startBottom = window.innerHeight - rect.bottom;
+      const startLeft = rect.left;
+      const startTop = rect.top;
       let moved = false;
 
       const onMove = (ev) => {
@@ -1325,19 +1372,23 @@
           document.body.style.cursor = "grabbing";
         }
         if (moved) {
+          // During drag, position via left/top for direct cursor-tracking.
+          // Anchor side will be re-derived on release.
           const r = root.getBoundingClientRect();
-          const newRight = clamp(
-            startRight - dx,
+          const newLeft = clamp(
+            startLeft + dx,
             8,
             window.innerWidth - r.width - 8,
           );
-          const newBottom = clamp(
-            startBottom - dy,
+          const newTop = clamp(
+            startTop + dy,
             8,
             window.innerHeight - r.height - 8,
           );
-          root.style.right = newRight + "px";
-          root.style.bottom = newBottom + "px";
+          root.style.left = newLeft + "px";
+          root.style.top = newTop + "px";
+          root.style.right = "auto";
+          root.style.bottom = "auto";
         }
       };
 
@@ -1346,10 +1397,11 @@
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
         if (moved) {
-          store.set(POSITION_KEY, {
-            right: parseInt(root.style.right, 10) || 20,
-            bottom: parseInt(root.style.bottom, 10) || 20,
-          });
+          // Compute the closest-edge anchor and persist it.
+          const pos = computeAnchor(root.getBoundingClientRect());
+          _savedPosition = pos;
+          storeSet(POSITION_KEY, pos);
+          applyAnchor(root, pos);
         } else if (onClick) {
           onClick(ev);
         }
@@ -1361,35 +1413,66 @@
     });
   }
 
+  let _savedPosition = null;
+
+  /**
+   * Apply the saved anchor to the root.
+   *
+   * Anchored to whichever edges the card is closest to. When the card
+   * grows or shrinks (collapsed pill ↔ expanded card), it stays flush
+   * against its anchored edges and grows toward the screen interior.
+   *
+   * Clamps the distances so the card never exits the viewport. Uses
+   * requestAnimationFrame because we may be called immediately after
+   * setting innerHTML; getBoundingClientRect at that point still reflects
+   * the OLD layout.
+   */
   function applySavedPosition(root) {
-    const pos = store.get(POSITION_KEY, null);
-    if (!pos || !Number.isFinite(pos.right) || !Number.isFinite(pos.bottom))
-      return;
-    const r = root.getBoundingClientRect();
-    const w = r.width || 360;
-    const h = r.height || 280;
-    root.style.right = clamp(pos.right, 8, window.innerWidth - w - 8) + "px";
-    root.style.bottom = clamp(pos.bottom, 8, window.innerHeight - h - 8) + "px";
+    const pos = _savedPosition;
+    if (!pos) return;
+
+    // Apply tentative anchor immediately so there's no flash.
+    applyAnchor(root, pos);
+
+    // Re-clamp once the new layout is ready.
+    requestAnimationFrame(() => {
+      const r = root.getBoundingClientRect();
+      const w = r.width || 360;
+      const h = r.height || 280;
+
+      const maxH = Math.max(8, window.innerWidth - w - 8);
+      const maxV = Math.max(8, window.innerHeight - h - 8);
+
+      const clamped = {
+        ...pos,
+        horizontalDist: clamp(pos.horizontalDist, 8, maxH),
+        verticalDist: clamp(pos.verticalDist, 8, maxV),
+      };
+      applyAnchor(root, clamped);
+    });
   }
 
   function reclampOnResize() {
     const host = ensureHost();
     const root = host?.shadowRoot?.getElementById("cut2-root");
     if (!root) return;
+
     const r = root.getBoundingClientRect();
-    const right = clamp(
-      window.innerWidth - r.right,
-      8,
-      window.innerWidth - r.width - 8,
-    );
-    const bottom = clamp(
-      window.innerHeight - r.bottom,
-      8,
-      window.innerHeight - r.height - 8,
-    );
-    root.style.right = right + "px";
-    root.style.bottom = bottom + "px";
-    store.set(POSITION_KEY, { right, bottom });
+    const w = r.width;
+    const h = r.height;
+
+    // Recompute anchor from current rect (the card's nearest edges may
+    // have changed if the user has resized the window dramatically).
+    const pos = computeAnchor(r);
+
+    const maxH = Math.max(8, window.innerWidth - w - 8);
+    const maxV = Math.max(8, window.innerHeight - h - 8);
+    pos.horizontalDist = clamp(pos.horizontalDist, 8, maxH);
+    pos.verticalDist = clamp(pos.verticalDist, 8, maxV);
+
+    applyAnchor(root, pos);
+    _savedPosition = pos;
+    storeSet(POSITION_KEY, pos);
   }
 
   // =====================================================================
@@ -1400,7 +1483,8 @@
   let _host = null;
 
   function ensureHost() {
-    if (_host && document.body.contains(_host)) return _host;
+    if (_host && document.body && document.body.contains(_host)) return _host;
+    if (!document.body) return null;
 
     _host = document.createElement("div");
     _host.id = HOST_ID;
@@ -1432,12 +1516,12 @@
     data: null,
     error: null,
     loading: false,
-    collapsed: store.get(COLLAPSED_KEY, true),
+    collapsed: true, // populated from storage during init()
   };
 
-  function setCollapsed(v) {
+  async function setCollapsed(v) {
     state.collapsed = v;
-    store.set(COLLAPSED_KEY, v);
+    await storeSet(COLLAPSED_KEY, v);
     render();
   }
 
@@ -1459,7 +1543,8 @@
       const result = await fetchUsage();
       state.data = result;
       state.error = null;
-      recordSnapshot(result.usage);
+      await recordSnapshot(result.usage);
+      await refreshHistoryCache();
     } catch (e) {
       state.error = e;
       console.warn("[CUT] fetch failed:", e);
@@ -1473,15 +1558,20 @@
   // BOOT
   // =====================================================================
 
-  function init() {
+  async function init() {
     if (!document.body) {
       setTimeout(init, 50);
       return;
     }
 
+    // Hydrate state from storage before first render.
+    state.collapsed = await storeGet(COLLAPSED_KEY, true);
+    _savedPosition = migrateAnchor(await storeGet(POSITION_KEY, null));
+    await refreshHistoryCache();
+
     ensureHost();
     render();
-    tick(true);
+    await tick(true);
 
     setInterval(tick, REFRESH_MS);
     setInterval(updateLiveTimes, UI_TICK_MS);
@@ -1492,7 +1582,7 @@
     window.addEventListener("resize", reclampOnResize);
 
     console.log(
-      "[CUT] v2.2.3 ready — API every",
+      "[CUT] v2.3.2 ready — API every",
       REFRESH_MS / 1000,
       "s, UI every",
       UI_TICK_MS / 1000,
@@ -1500,5 +1590,5 @@
     );
   }
 
-  init();
+  await init();
 })();
