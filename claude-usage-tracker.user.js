@@ -1,14 +1,21 @@
 // ==UserScript==
-// @name         Claude Usage Tracker (Editorial)
-// @namespace    com.user.claude-usage-tracker.editorial
-// @version      2.2.3
-// @description  Floating editorial dashboard for Claude usage. Dual ring with hover-swap, weekly bars, smooth 7-day area chart, manual refresh.
-// @author       you
-// @match        https://claude.ai/*
-// @run-at       document-end
-// @grant        GM_setValue
-// @grant        GM_getValue
+// @name Claude Usage Tracker
+// @icon https://www.anthropic.com/images/icons/apple-touch-icon.png
+// @namespace https://github.com/AtlasChaojieChen/claude-usage-tracker
+// @version 2.3.0
+// @description Floating editorial dashboard for Claude.ai usage. Dual ring with hover-swap, weekly bars, smooth 7-day area chart, manual refresh.
+// @author AtlasChaojieChen // @homepageURL https://github.com/AtlasChaojieChen/claude-usage-tracker
+// @supportURL https://github.com/AtlasChaojieChen/claude-usage-tracker/issues
+// @updateURL https://raw.githubusercontent.com/AtlasChaojieChen/claude-usage-tracker/main/claude-usage-tracker.user.js
+// @downloadURL https://raw.githubusercontent.com/AtlasChaojieChen/claude-usage-tracker/main/claude-usage-tracker.user.js
+// @match https://claude.ai/*
+// @connect claude.ai
+// @run-at document-end
+// @run-in normal-tabs
 // @noframes
+// @sandbox DOM
+// @grant GM.getValue
+// @grant GM.setValue
 // ==/UserScript==
 
 (function () {
